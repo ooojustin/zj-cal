@@ -1,3 +1,5 @@
+mod calendar;
+
 use std::collections::BTreeMap;
 use zellij_tile::prelude::*;
 
