@@ -2,6 +2,7 @@ mod calendar;
 mod config;
 
 use config::Config;
+use owo_colors::OwoColorize;
 use std::collections::BTreeMap;
 use zellij_tile::prelude::*;
 
@@ -117,8 +118,57 @@ impl ZellijPlugin for State {
         }
     }
 
-    fn render(&mut self, _rows: usize, _cols: usize) {
-        println!("zj-cal");
+    fn render(&mut self, rows: usize, cols: usize) {
+        let width = cols.min(50);
+
+        if self.ics_url.is_empty() {
+            println!("{}", "⚠ No ICS URL configured".yellow());
+            println!();
+            println!("Add to your plugin config:");
+            println!("  ics_url \"https://...\"");
+            return;
+        }
+
+        print!("{} ", "📅 Calendar".blue().bold());
+        if self.current_time.len() >= 16 {
+            let time_str = calendar::format_time(&self.current_time[11..16], self.use_12h_time);
+            print!("{}", time_str.dimmed());
+            if self.loading {
+                println!(" {}", "↻".yellow());
+            } else {
+                println!();
+            }
+        } else if self.loading {
+            println!("{}", "↻".yellow());
+        } else {
+            println!();
+        }
+        println!("{}", "─".repeat(width));
+
+        if let Some(ref err) = self.error {
+            println!("{}", truncate(err, width).red());
+            return;
+        }
+
+        if self.events.is_empty() {
+            println!("{}", "No upcoming events".dimmed());
+            return;
+        }
+
+        let max_events = rows.saturating_sub(4);
+        for event in self.events.iter().take(max_events) {
+            let time = calendar::format_datetime_display(&event.start, self.use_12h_time);
+            let summary = truncate(&event.summary, width.saturating_sub(time.len() + 3));
+            let icon = if event.is_video_call() { "📹" } else { "•" };
+            println!("{} {} {}", time.cyan(), icon, summary);
+        }
+
+        if self.events.len() > max_events {
+            println!(
+                "{}",
+                format!("  +{} more", self.events.len() - max_events).dimmed()
+            );
+        }
     }
 }
 
@@ -144,5 +194,14 @@ impl State {
         context.insert("source".to_string(), "ics_fetch".to_string());
 
         run_command(&["curl", "-sSfL", "--", &self.ics_url], context);
+    }
+}
+
+fn truncate(s: &str, max_len: usize) -> String {
+    if s.chars().count() <= max_len {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_len.saturating_sub(3)).collect();
+        format!("{}...", truncated)
     }
 }
