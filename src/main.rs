@@ -1,28 +1,31 @@
+#[macro_use]
+mod macros;
 mod calendar;
 mod config;
-
 use config::Config;
 use owo_colors::OwoColorize;
 use std::collections::BTreeMap;
 use zellij_tile::prelude::*;
 
 pub const TIME_TICK_SECS: f64 = 30.0;
+const DEBUG_SAVE_ICS: bool = true;
 
-macro_rules! log {
-    ($($arg:tt)*) => {
-        eprintln!("[zj-cal] {}", format!($($arg)*))
-    };
+define_ctx! {
+    TimeFetch => "time_fetch",
+    IcsFetch => "ics_fetch",
+    IcsFetchFile { path: String } => "ics_fetch_file",
+    IcsReadFile { path: String } => "ics_read_file",
 }
 
 #[derive(Default)]
 struct State {
     events: Vec<calendar::Event>,
     ics_url: String,
-    calendar_refresh_ticks: u32,
+    calendar_refresh_ticks: u32, // Fetch calendar every N time ticks
     error: Option<String>,
     loading: bool,
     permission_granted: bool,
-    current_time: String,
+    current_time: String, // Format: "YYYY-MM-DD HH:MM"
     ticks_until_calendar: u32,
     use_12h_time: bool,
 }
@@ -36,17 +39,23 @@ impl ZellijPlugin for State {
         self.ics_url = config.ics_url;
         self.use_12h_time = config.use_12h_time;
         self.calendar_refresh_ticks = (config.refresh_interval_secs / TIME_TICK_SECS).ceil() as u32;
-        self.ticks_until_calendar = 0;
+        self.ticks_until_calendar = 0; // Fetch immediately on first tick
 
         log!(
             "load() ics_url={}, refresh_interval={}s (every {} ticks)",
-            if self.ics_url.is_empty() { "unset" } else { "[REDACTED]" },
+            if self.ics_url.is_empty() {
+                "unset"
+            } else {
+                "[REDACTED]"
+            },
             config.refresh_interval_secs,
             self.calendar_refresh_ticks
         );
 
+        // Request necessary permissions
         request_permission(&[PermissionType::RunCommands]);
 
+        // Subscribe to events
         subscribe(&[
             EventType::Timer,
             EventType::RunCommandResult,
@@ -60,6 +69,8 @@ impl ZellijPlugin for State {
                 log!("PermissionRequestResult: {:?}", status);
                 if status == PermissionStatus::Granted && !self.permission_granted {
                     self.permission_granted = true;
+                    // Use a short delay to let permission system fully initialize
+                    // This works around a race condition in Zellij
                     log!("Permission granted, scheduling fetch...");
                     set_timeout(0.1);
                 } else if status != PermissionStatus::Granted {
@@ -72,45 +83,23 @@ impl ZellijPlugin for State {
                 set_timeout(TIME_TICK_SECS);
                 true
             }
-            Event::RunCommandResult(exit_code, stdout, stderr, context) => {
-                match context.get("source").map(|s| s.as_str()) {
-                    Some("time_fetch") => {
-                        if exit_code == Some(0) {
-                            self.current_time = String::from_utf8_lossy(&stdout).trim().to_string();
-                            log!("Current time: {}", self.current_time);
-
-                            if self.ticks_until_calendar == 0 {
-                                self.ticks_until_calendar = self.calendar_refresh_ticks;
-                                self.fetch_calendar();
-                            } else {
-                                self.ticks_until_calendar -= 1;
-                                self.loading = false;
-                            }
-                        } else {
-                            log!("Failed to get time: {}", String::from_utf8_lossy(&stderr));
-                            self.loading = false;
-                        }
+            Event::RunCommandResult(exit_code, stdout, stderr, ctx) => {
+                match Ctx::from_map(&ctx) {
+                    Ok(Ctx::TimeFetch) => {
+                        self.handle_time_fetch(exit_code, stdout, stderr);
                     }
-                    Some("ics_fetch") => {
-                        self.loading = false;
-                        if exit_code == Some(0) {
-                            log!("Fetched ICS ({} bytes)", stdout.len());
-                            match calendar::parse_ics(&stdout) {
-                                Ok(events) => {
-                                    self.events = calendar::filter_upcoming(events, &self.current_time, 20);
-                                    self.error = None;
-                                }
-                                Err(e) => {
-                                    log!("Failed to parse ICS: {}", e);
-                                    self.error = Some(e);
-                                }
-                            }
-                        } else {
-                            let err_msg = String::from_utf8_lossy(&stderr);
-                            self.error = Some(format!("Fetch failed: {}", err_msg));
-                        }
+                    Ok(Ctx::IcsFetch) => {
+                        self.handle_ics_fetch(exit_code, stdout, stderr);
                     }
-                    _ => {}
+                    Ok(Ctx::IcsFetchFile { path }) => {
+                        self.handle_ics_fetch_file(exit_code, stderr, path);
+                    }
+                    Ok(Ctx::IcsReadFile { .. }) => {
+                        self.handle_ics_read_file(exit_code, stdout, stderr);
+                    }
+                    Err(err) => {
+                        log!("Invalid context: {}", err);
+                    }
                 }
                 true
             }
@@ -129,6 +118,7 @@ impl ZellijPlugin for State {
             return;
         }
 
+        // Header - show time as soon as we have it, with optional loading indicator
         print!("{} ", "📅 Calendar".blue().bold());
         if self.current_time.len() >= 16 {
             let time_str = calendar::format_time(&self.current_time[11..16], self.use_12h_time);
@@ -145,16 +135,19 @@ impl ZellijPlugin for State {
         }
         println!("{}", "─".repeat(width));
 
+        // Error display
         if let Some(ref err) = self.error {
             println!("{}", truncate(err, width).red());
             return;
         }
 
+        // Events
         if self.events.is_empty() {
             println!("{}", "No upcoming events".dimmed());
             return;
         }
 
+        // Reserve: 1 header + 1 separator + 1 "+more" + 1 buffer for floating mode
         let max_events = rows.saturating_sub(4);
         for event in self.events.iter().take(max_events) {
             let time = calendar::format_datetime_display(&event.start, self.use_12h_time);
@@ -174,13 +167,10 @@ impl ZellijPlugin for State {
 
 impl State {
     fn fetch_time(&mut self) {
-        log!("fetch_time()");
+        log!("fetch_time() - getting current time");
         self.loading = true;
 
-        let mut context = BTreeMap::new();
-        context.insert("source".to_string(), "time_fetch".to_string());
-
-        run_command(&["date", "+%Y-%m-%d %H:%M"], context);
+        run_command(&["date", "+%Y-%m-%d %H:%M"], Ctx::TimeFetch.into_map());
     }
 
     fn fetch_calendar(&mut self) {
@@ -188,12 +178,91 @@ impl State {
             return;
         }
 
-        log!("fetch_calendar()");
+        let mut curl_args = vec!["curl".to_string(), "-sSfL".to_string()];
 
-        let mut context = BTreeMap::new();
-        context.insert("source".to_string(), "ics_fetch".to_string());
+        let ctx = if DEBUG_SAVE_ICS {
+            let timestamp = self.current_time.replace([':', ' '], "-");
+            let path = format!("/tmp/zj-cal/{}.ics", timestamp);
+            log!("fetch_calendar() - saving to {}", path);
+            curl_args.push("--create-dirs".to_string());
+            curl_args.push("--output".to_string());
+            curl_args.push(path.clone());
+            Ctx::IcsFetchFile { path }
+        } else {
+            log!("fetch_calendar()");
+            Ctx::IcsFetch
+        };
 
-        run_command(&["curl", "-sSfL", "--", &self.ics_url], context);
+        curl_args.push("--".to_string());
+        curl_args.push(self.ics_url.clone());
+
+        let curl_args_ref: Vec<&str> = curl_args.iter().map(|s| s.as_str()).collect();
+        run_command(&curl_args_ref, ctx.into_map());
+    }
+
+    fn handle_ics_output(
+        &mut self,
+        exit_code: Option<i32>,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        action_label: &str,
+        error_label: &str,
+    ) {
+        self.loading = false;
+        if exit_code == Some(0) {
+            log!("{} ({} bytes)", action_label, stdout.len());
+            match calendar::parse_ics(&stdout) {
+                Ok(events) => {
+                    self.events = calendar::filter_upcoming(events, &self.current_time, 20);
+                    self.error = None;
+                }
+                Err(e) => {
+                    log!("Failed to parse ICS: {}", e);
+                    self.error = Some(e);
+                }
+            }
+        } else {
+            let err_msg = String::from_utf8_lossy(&stderr);
+            self.error = Some(format!("{}: {}", error_label, err_msg));
+        }
+    }
+
+    fn handle_ics_fetch(&mut self, exit_code: Option<i32>, stdout: Vec<u8>, stderr: Vec<u8>) {
+        self.handle_ics_output(exit_code, stdout, stderr, "Fetched ICS", "Fetch failed");
+    }
+
+    fn handle_ics_read_file(&mut self, exit_code: Option<i32>, stdout: Vec<u8>, stderr: Vec<u8>) {
+        self.handle_ics_output(exit_code, stdout, stderr, "Read ICS", "Read failed");
+    }
+
+    fn handle_time_fetch(&mut self, exit_code: Option<i32>, stdout: Vec<u8>, stderr: Vec<u8>) {
+        if exit_code == Some(0) {
+            self.current_time = String::from_utf8_lossy(&stdout).trim().to_string();
+            log!("Current time: {}", self.current_time);
+
+            // Fetch calendar when counter reaches 0
+            if self.ticks_until_calendar == 0 {
+                self.ticks_until_calendar = self.calendar_refresh_ticks;
+                self.fetch_calendar();
+            } else {
+                self.ticks_until_calendar -= 1;
+                self.loading = false;
+            }
+        } else {
+            log!("Failed to get time: {}", String::from_utf8_lossy(&stderr));
+            self.loading = false;
+        }
+    }
+
+    fn handle_ics_fetch_file(&mut self, exit_code: Option<i32>, stderr: Vec<u8>, path: String) {
+        if exit_code == Some(0) {
+            let read_ctx = Ctx::IcsReadFile { path: path.clone() }.into_map();
+            run_command(&["cat", path.as_str()], read_ctx);
+        } else {
+            self.loading = false;
+            let err_msg = String::from_utf8_lossy(&stderr);
+            self.error = Some(format!("Fetch failed: {}", err_msg));
+        }
     }
 }
 
