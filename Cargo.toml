@@ -21,3 +21,6 @@ all = "deny"
 opt-level = "z"
 lto = true
 strip = true
+
+[dev-dependencies]
+indoc = "2.0.7"

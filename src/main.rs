@@ -2,13 +2,18 @@
 mod macros;
 mod calendar;
 mod config;
+use chrono::{NaiveDateTime, Timelike};
 use config::Config;
 use owo_colors::OwoColorize;
 use std::collections::BTreeMap;
 use zellij_tile::prelude::*;
 
+/// Interval between timer ticks (updates time display, may trigger calendar refresh).
 pub const TIME_TICK_SECS: f64 = 30.0;
-const DEBUG_SAVE_ICS: bool = true;
+
+/// Save fetched ICS files for debugging. (Path: `/tmp/zj-cal/`)
+/// Set ZJ_CAL_DEBUG_ICS=1 at build time.
+const DEBUG_SAVE_ICS: bool = option_env!("ZJ_CAL_DEBUG_ICS").is_some();
 
 define_ctx! {
     TimeFetch => "time_fetch",
@@ -25,7 +30,7 @@ struct State {
     error: Option<String>,
     loading: bool,
     permission_granted: bool,
-    current_time: String, // Format: "YYYY-MM-DD HH:MM"
+    current_time: Option<NaiveDateTime>,
     ticks_until_calendar: u32,
     use_12h_time: bool,
 }
@@ -120,8 +125,8 @@ impl ZellijPlugin for State {
 
         // Header - show time as soon as we have it, with optional loading indicator
         print!("{} ", "📅 Calendar".blue().bold());
-        if self.current_time.len() >= 16 {
-            let time_str = calendar::format_time(&self.current_time[11..16], self.use_12h_time);
+        if let Some(now) = self.current_time {
+            let time_str = calendar::fmt_time(now.hour(), now.minute(), self.use_12h_time);
             print!("{}", time_str.dimmed());
             if self.loading {
                 println!(" {}", "↻".yellow());
@@ -149,9 +154,14 @@ impl ZellijPlugin for State {
 
         // Reserve: 1 header + 1 separator + 1 "+more" + 1 buffer for floating mode
         let max_events = rows.saturating_sub(4);
+        let now = self.current_time.unwrap_or_default();
         for event in self.events.iter().take(max_events) {
-            let time =
-                calendar::format_event_time(&event.start, &self.current_time, self.use_12h_time);
+            let in_progress = event.is_in_progress(now);
+            let time = if in_progress {
+                "now".to_string()
+            } else {
+                calendar::fmt_relative_time(event.start, now, self.use_12h_time)
+            };
             let summary = truncate(&event.summary, width.saturating_sub(time.len() + 3));
             let icon = if event.is_video_call() { "📹" } else { "•" };
             if time == "now" {
@@ -187,7 +197,10 @@ impl State {
         let mut curl_args = vec!["curl".to_string(), "-sSfL".to_string()];
 
         let ctx = if DEBUG_SAVE_ICS {
-            let timestamp = self.current_time.replace([':', ' '], "-");
+            let timestamp = self
+                .current_time
+                .map(|t| t.format("%Y-%m-%d-%H-%M").to_string())
+                .unwrap_or_else(|| "unknown".to_string());
             let path = format!("/tmp/zj-cal/{}.ics", timestamp);
             log!("fetch_calendar() - saving to {}", path);
             curl_args.push("--create-dirs".to_string());
@@ -219,7 +232,7 @@ impl State {
             log!("{} ({} bytes)", action_label, stdout.len());
             match calendar::parse_ics(&stdout) {
                 Ok(events) => {
-                    self.events = calendar::filter_upcoming(events, &self.current_time, 20);
+                    self.events = calendar::filter_future(events, self.current_time, 20);
                     self.error = None;
                 }
                 Err(e) => {
@@ -243,8 +256,9 @@ impl State {
 
     fn handle_time_fetch(&mut self, exit_code: Option<i32>, stdout: Vec<u8>, stderr: Vec<u8>) {
         if exit_code == Some(0) {
-            self.current_time = String::from_utf8_lossy(&stdout).trim().to_string();
-            log!("Current time: {}", self.current_time);
+            let time_str = String::from_utf8_lossy(&stdout).trim().to_string();
+            self.current_time = calendar::parse_datetime(&time_str);
+            log!("Current time: {:?}", self.current_time);
 
             // Fetch calendar when counter reaches 0
             if self.ticks_until_calendar == 0 {
