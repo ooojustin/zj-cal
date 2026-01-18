@@ -2,6 +2,7 @@ set dotenv-load
 
 root := justfile_directory()
 ics_url := env_var_or_default("ZJ_CAL_ICS_URL", "")
+test_port := "8088"
 
 # ANSI color codes
 export C_RESET := '\x1b[0m'
@@ -51,6 +52,22 @@ run *args: build
         echo -e "${C_BOLD}${C_CYAN}Running:${C_RESET}\n  zellij plugin -s -c \"$display_config\" -- \"$plugin_path\""
         zellij plugin -s -c "$config" -- "$plugin_path"
     fi
+
+# Generate test ICS file
+test-ics:
+    ./scripts/gen-test-ics.sh > /tmp/zj-cal-test.ics
+    @echo -e "${C_GREEN}Generated /tmp/zj-cal-test.ics${C_RESET}"
+
+# Serve test ICS on localhost
+serve-test: test-ics
+    #!/usr/bin/env bash
+    echo -e "${C_CYAN}Serving test calendar at http://localhost:{{test_port}}/zj-cal-test.ics${C_RESET}"
+    echo -e "${C_CYAN}Run in another terminal: just run-test${C_RESET}"
+    cd /tmp && python3 -m http.server {{test_port}}
+
+# Run plugin with test calendar
+run-test *args: build
+    ZJ_CAL_ICS_URL="http://localhost:{{test_port}}/zj-cal-test.ics" just run {{args}}
 
 # Watch plugin logs
 # Use -a/--all to show all Zellij logs (not just zj-cal)
