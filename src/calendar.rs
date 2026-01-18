@@ -1,3 +1,4 @@
+use chrono::NaiveDateTime;
 use icalendar::{Calendar, CalendarComponent, Component, DatePerhapsTime, EventLike};
 use serde::{Deserialize, Serialize};
 
@@ -102,18 +103,18 @@ pub fn format_datetime_display(dt: &str, use_12h: bool) -> String {
         let time = &dt[11..16];
 
         let month_name = match month {
-            "01" => "Jan",
-            "02" => "Feb",
-            "03" => "Mar",
-            "04" => "Apr",
-            "05" => "May",
-            "06" => "Jun",
-            "07" => "Jul",
-            "08" => "Aug",
-            "09" => "Sep",
-            "10" => "Oct",
-            "11" => "Nov",
-            "12" => "Dec",
+            "01" => "jan",
+            "02" => "feb",
+            "03" => "mar",
+            "04" => "apr",
+            "05" => "may",
+            "06" => "jun",
+            "07" => "jul",
+            "08" => "aug",
+            "09" => "sep",
+            "10" => "oct",
+            "11" => "nov",
+            "12" => "dec",
             _ => month,
         };
 
@@ -130,5 +131,72 @@ pub fn format_datetime_display(dt: &str, use_12h: bool) -> String {
         }
     } else {
         dt.to_string()
+    }
+}
+
+fn parse_datetime(dt: &str) -> Option<NaiveDateTime> {
+    NaiveDateTime::parse_from_str(dt, "%Y-%m-%d %H:%M").ok()
+}
+
+/// "9:00 am" -> "9am", "9:30 am" -> "9:30am"
+fn compact_time(time: &str) -> String {
+    time.replace(":00 ", "").replace(' ', "")
+}
+
+/// Formats an event time relative to the current time.
+pub fn format_event_time(event_time: &str, current_time: &str, use_12h: bool) -> String {
+    let Some(event_dt) = parse_datetime(event_time) else {
+        // Failed to parse event time, fallback to absolute
+        return format_datetime_display(event_time, use_12h);
+    };
+    let Some(now_dt) = parse_datetime(current_time) else {
+        // Failed to parse current time, fallback to absolute
+        return format_datetime_display(event_time, use_12h);
+    };
+
+    let minutes = event_dt.signed_duration_since(now_dt).num_minutes();
+
+    // Past events or >24h away: absolute format
+    if !(0..=24 * 60).contains(&minutes) {
+        return format_datetime_display(event_time, use_12h);
+    }
+
+    let is_tomorrow = event_dt.date() != now_dt.date();
+    let time_part = &event_time[11..16];
+    let is_all_day = time_part == "00:00";
+
+    // All-day events get date-only labels, not relative time
+    if is_all_day {
+        return if is_tomorrow {
+            "tmrw".to_string()
+        } else {
+            "today".to_string()
+        };
+    }
+
+    match minutes {
+        0 => "now".to_string(),
+        1..=59 => format!("in {} min", minutes),
+        60..=299 => {
+            let whole_hours = minutes / 60;
+            let remainder = minutes % 60;
+            // Show .5 if within 10 min of half hour (20-40 min past)
+            if (20..=40).contains(&remainder) {
+                format!("in {}.5 hrs", whole_hours)
+            } else if remainder > 40 {
+                // Round up
+                format!("in {} hrs", whole_hours + 1)
+            } else if whole_hours == 1 {
+                "in 1 hr".to_string()
+            } else {
+                format!("in {} hrs", whole_hours)
+            }
+        }
+        _ if is_tomorrow => {
+            format!("tmrw {}", compact_time(&format_time(time_part, use_12h)))
+        }
+        _ => {
+            format!("today {}", compact_time(&format_time(time_part, use_12h)))
+        }
     }
 }

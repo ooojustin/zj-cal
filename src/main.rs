@@ -150,10 +150,15 @@ impl ZellijPlugin for State {
         // Reserve: 1 header + 1 separator + 1 "+more" + 1 buffer for floating mode
         let max_events = rows.saturating_sub(4);
         for event in self.events.iter().take(max_events) {
-            let time = calendar::format_datetime_display(&event.start, self.use_12h_time);
+            let time =
+                calendar::format_event_time(&event.start, &self.current_time, self.use_12h_time);
             let summary = truncate(&event.summary, width.saturating_sub(time.len() + 3));
             let icon = if event.is_video_call() { "📹" } else { "•" };
-            println!("{} {} {}", time.cyan(), icon, summary);
+            if time == "now" {
+                println!("{} {} {}", time.green().bold(), icon, summary.bold());
+            } else {
+                println!("{} {} {}", time.cyan(), icon, summary);
+            }
         }
 
         if self.events.len() > max_events {
@@ -166,10 +171,11 @@ impl ZellijPlugin for State {
 }
 
 impl State {
+    /// Fetches the current local time via shell command.
     fn fetch_time(&mut self) {
         log!("fetch_time() - getting current time");
         self.loading = true;
-
+        // NOTE: We do this via shell because WASM sandbox doesn't have access to timezone info.
         run_command(&["date", "+%Y-%m-%d %H:%M"], Ctx::TimeFetch.into_map());
     }
 
