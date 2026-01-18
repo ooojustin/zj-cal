@@ -1,4 +1,4 @@
-use chrono::{Datelike, NaiveDateTime, Timelike};
+use chrono::{NaiveDate, NaiveDateTime, Timelike};
 use icalendar::CalendarDateTime;
 use icalendar::{Calendar, CalendarComponent, Component, DatePerhapsTime, EventLike};
 
@@ -10,6 +10,7 @@ pub struct Event {
     #[allow(dead_code)]
     pub end: Option<NaiveDateTime>,
     pub location: Option<String>,
+    pub is_all_day: bool,
 }
 
 impl Event {
@@ -20,8 +21,23 @@ impl Event {
             .unwrap_or(false)
     }
 
+    /// Returns true if the event is currently in progress (started and not ended).
     pub fn is_in_progress(&self, now: NaiveDateTime) -> bool {
         self.end.is_some_and(|end| self.start <= now && now < end)
+    }
+
+    /// Returns true if the event should be considered active on the given date.
+    pub fn is_active_on(&self, date: NaiveDate) -> bool {
+        let start_date = self.start.date();
+        match self.end {
+            Some(end) if self.is_all_day => start_date <= date && date < end.date(),
+            Some(end) => {
+                // Timed event: active if it overlaps the date (handles overnight events)
+                let day_start = date.and_hms_opt(0, 0, 0).unwrap();
+                start_date <= date && end > day_start
+            }
+            None => start_date == date,
+        }
     }
 }
 
@@ -36,9 +52,9 @@ pub fn parse_ics(data: &[u8], utc_offset_minutes: i32) -> Result<Vec<Event>, Str
         .filter_map(|component| {
             if let CalendarComponent::Event(event) = component {
                 let summary = event.get_summary().unwrap_or("(no title)").to_string();
-                let start = event
-                    .get_start()
-                    .map(|dt| parse_date_perhaps_time(dt, utc_offset_minutes))?;
+                let start_raw = event.get_start()?;
+                let is_all_day = matches!(&start_raw, DatePerhapsTime::Date(_));
+                let start = parse_date_perhaps_time(start_raw, utc_offset_minutes);
                 let end = event
                     .get_end()
                     .map(|dt| parse_date_perhaps_time(dt, utc_offset_minutes));
@@ -49,6 +65,7 @@ pub fn parse_ics(data: &[u8], utc_offset_minutes: i32) -> Result<Vec<Event>, Str
                     start,
                     end,
                     location,
+                    is_all_day,
                 })
             } else {
                 None
@@ -132,30 +149,50 @@ pub fn fmt_time(hour: u32, minute: u32, use_12h: bool) -> String {
 /// (e.g., "jan 15 10:00 am" or "jan 15" for all-day)
 pub fn fmt_datetime(dt: NaiveDateTime, use_12h: bool) -> String {
     let is_all_day = dt.hour() == 0 && dt.minute() == 0;
+    let date = dt.format("%b %-d").to_string().to_lowercase();
 
     if is_all_day {
-        format!("{} {}", month_name(dt.month()), dt.day())
+        date
     } else {
-        let formatted_time = fmt_time(dt.hour(), dt.minute(), use_12h);
-        format!("{} {} {}", month_name(dt.month()), dt.day(), formatted_time)
+        format!("{} {}", date, fmt_time(dt.hour(), dt.minute(), use_12h))
+    }
+}
+
+/// Formats a date as a day group header.
+/// (e.g., "today", "tomorrow", or "tuesday, jan 22")
+pub fn fmt_day_header(event_date: NaiveDate, today: NaiveDate) -> String {
+    let days_diff = (event_date - today).num_days();
+    match days_diff {
+        0 => "today".to_string(),
+        1 => "tomorrow".to_string(),
+        _ => event_date.format("%A, %b %-d").to_string().to_lowercase(),
+    }
+}
+
+/// Formats event time for display within a day group.
+/// All-day events return "all day". Today uses relative time, other days just the time.
+pub fn fmt_time_in_group(
+    event_dt: NaiveDateTime,
+    now_dt: NaiveDateTime,
+    is_today: bool,
+    is_all_day: bool,
+    use_12h: bool,
+) -> String {
+    if is_all_day {
+        return "all day".to_string();
+    }
+
+    if is_today {
+        fmt_relative_time(event_dt, now_dt, use_12h)
+    } else {
+        fmt_time(event_dt.hour(), event_dt.minute(), use_12h)
     }
 }
 
 /// Formats event time relative to now.
 /// (e.g., "now", "in 30 min", "today 5 pm", "tmrw 9:00 am", or absolute)
+/// Note: Caller should handle all-day events before calling this function.
 pub fn fmt_relative_time(event_dt: NaiveDateTime, now_dt: NaiveDateTime, use_12h: bool) -> String {
-    let is_all_day = event_dt.hour() == 0 && event_dt.minute() == 0;
-
-    // All-day events use date comparison, not time difference
-    if is_all_day {
-        let days_diff = (event_dt.date() - now_dt.date()).num_days();
-        return match days_diff {
-            0 => "today".to_string(),
-            1 => "tmrw".to_string(),
-            _ => fmt_datetime(event_dt, use_12h),
-        };
-    }
-
     let minutes = event_dt.signed_duration_since(now_dt).num_minutes();
 
     // Past events or >24h away: absolute format
@@ -201,26 +238,6 @@ pub fn fmt_relative_time(event_dt: NaiveDateTime, now_dt: NaiveDateTime, use_12h
             let time = fmt_time(event_dt.hour(), event_dt.minute(), use_12h);
             format!("today {}", time)
         }
-    }
-}
-
-/// Converts months number (1-12) to short name.
-/// (e.g., 1 -> "jan", 2 -> "feb", etc.)
-fn month_name(month: u32) -> &'static str {
-    match month {
-        1 => "jan",
-        2 => "feb",
-        3 => "mar",
-        4 => "apr",
-        5 => "may",
-        6 => "jun",
-        7 => "jul",
-        8 => "aug",
-        9 => "sep",
-        10 => "oct",
-        11 => "nov",
-        12 => "dec",
-        _ => unreachable!(),
     }
 }
 
@@ -333,30 +350,35 @@ mod tests {
             start: NaiveDateTime::default(),
             end: None,
             location: Some("https://zoom.us/j/123".into()),
+            is_all_day: false,
         };
         let meet = Event {
             summary: "Call".into(),
             start: NaiveDateTime::default(),
             end: None,
             location: Some("https://meet.google.com/abc".into()),
+            is_all_day: false,
         };
         let teams = Event {
             summary: "Call".into(),
             start: NaiveDateTime::default(),
             end: None,
             location: Some("https://teams.microsoft.com/l/meetup".into()),
+            is_all_day: false,
         };
         let office = Event {
             summary: "Meeting".into(),
             start: NaiveDateTime::default(),
             end: None,
             location: Some("Conference Room A".into()),
+            is_all_day: false,
         };
         let none = Event {
             summary: "Meeting".into(),
             start: NaiveDateTime::default(),
             end: None,
             location: None,
+            is_all_day: false,
         };
 
         assert!(zoom.is_video_call());
@@ -373,6 +395,7 @@ mod tests {
             start: parse_datetime("2024-01-15 10:00").unwrap(),
             end: parse_datetime("2024-01-15 11:00"),
             location: None,
+            is_all_day: false,
         };
 
         // Before start
@@ -392,8 +415,86 @@ mod tests {
             start: parse_datetime("2024-01-15 10:00").unwrap(),
             end: None,
             location: None,
+            is_all_day: false,
         };
         assert!(!no_end.is_in_progress(parse_datetime("2024-01-15 10:30").unwrap()));
+
+        // Event with non-zero seconds in start time - should NOT show as in-progress before it starts
+        let event_with_secs = Event {
+            summary: "Meeting".into(),
+            start: NaiveDate::from_ymd_opt(2024, 1, 15)
+                .unwrap()
+                .and_hms_opt(10, 0, 30)
+                .unwrap(), // 10:00:30
+            end: Some(
+                NaiveDate::from_ymd_opt(2024, 1, 15)
+                    .unwrap()
+                    .and_hms_opt(11, 0, 0)
+                    .unwrap(),
+            ),
+            location: None,
+            is_all_day: false,
+        };
+        // At 10:00:15, event hasn't started yet (starts at 10:00:30)
+        let now_before = NaiveDate::from_ymd_opt(2024, 1, 15)
+            .unwrap()
+            .and_hms_opt(10, 0, 15)
+            .unwrap();
+        assert!(!event_with_secs.is_in_progress(now_before));
+    }
+
+    #[test]
+    fn test_is_active_on() {
+        // Multi-day all-day event: Jan 15-18 (3 days)
+        let multi_day = Event {
+            summary: "Conference".into(),
+            start: parse_datetime("2024-01-15 00:00").unwrap(),
+            end: parse_datetime("2024-01-18 00:00"),
+            location: None,
+            is_all_day: true,
+        };
+        assert!(!multi_day.is_active_on(NaiveDate::from_ymd_opt(2024, 1, 14).unwrap()));
+        assert!(multi_day.is_active_on(NaiveDate::from_ymd_opt(2024, 1, 15).unwrap()));
+        assert!(multi_day.is_active_on(NaiveDate::from_ymd_opt(2024, 1, 16).unwrap()));
+        assert!(multi_day.is_active_on(NaiveDate::from_ymd_opt(2024, 1, 17).unwrap()));
+        assert!(!multi_day.is_active_on(NaiveDate::from_ymd_opt(2024, 1, 18).unwrap())); // end is exclusive
+
+        // Single-day all-day event
+        let single_day = Event {
+            summary: "Holiday".into(),
+            start: parse_datetime("2024-01-15 00:00").unwrap(),
+            end: parse_datetime("2024-01-16 00:00"),
+            location: None,
+            is_all_day: true,
+        };
+        assert!(!single_day.is_active_on(NaiveDate::from_ymd_opt(2024, 1, 14).unwrap()));
+        assert!(single_day.is_active_on(NaiveDate::from_ymd_opt(2024, 1, 15).unwrap()));
+        assert!(!single_day.is_active_on(NaiveDate::from_ymd_opt(2024, 1, 16).unwrap()));
+
+        // Timed event - only active on start date
+        let timed = Event {
+            summary: "Meeting".into(),
+            start: parse_datetime("2024-01-15 10:00").unwrap(),
+            end: parse_datetime("2024-01-15 11:00"),
+            location: None,
+            is_all_day: false,
+        };
+        assert!(!timed.is_active_on(NaiveDate::from_ymd_opt(2024, 1, 14).unwrap()));
+        assert!(timed.is_active_on(NaiveDate::from_ymd_opt(2024, 1, 15).unwrap()));
+        assert!(!timed.is_active_on(NaiveDate::from_ymd_opt(2024, 1, 16).unwrap()));
+
+        // Timed event spanning midnight (11pm - 1am) - should be active on both days
+        let overnight = Event {
+            summary: "Overnight".into(),
+            start: parse_datetime("2024-01-15 23:00").unwrap(),
+            end: parse_datetime("2024-01-16 01:00"),
+            location: None,
+            is_all_day: false,
+        };
+        assert!(!overnight.is_active_on(NaiveDate::from_ymd_opt(2024, 1, 14).unwrap()));
+        assert!(overnight.is_active_on(NaiveDate::from_ymd_opt(2024, 1, 15).unwrap()));
+        assert!(overnight.is_active_on(NaiveDate::from_ymd_opt(2024, 1, 16).unwrap())); // spans into this day
+        assert!(!overnight.is_active_on(NaiveDate::from_ymd_opt(2024, 1, 17).unwrap()));
     }
 
     #[test]
@@ -491,9 +592,17 @@ mod tests {
 
     #[test]
     fn test_all_day_events() {
-        // All-day events (00:00) get date-only labels
-        assert_eq!(fmt("2024-01-15 00:00", "2024-01-15 10:00"), "today");
-        assert_eq!(fmt("2024-01-16 00:00", "2024-01-15 20:00"), "tmrw");
+        // All-day events get "all day" label via fmt_time_in_group
+        let event_dt = parse_datetime("2024-01-15 00:00").unwrap();
+        let now_dt = parse_datetime("2024-01-15 10:00").unwrap();
+        assert_eq!(
+            fmt_time_in_group(event_dt, now_dt, true, true, true),
+            "all day"
+        );
+        assert_eq!(
+            fmt_time_in_group(event_dt, now_dt, false, true, true),
+            "all day"
+        );
     }
 
     #[test]
@@ -525,6 +634,7 @@ mod tests {
                 start: parse_datetime("2024-01-15 10:00").unwrap(),
                 end: parse_datetime("2024-01-15 11:00"),
                 location: None,
+                is_all_day: false,
             },
             // Fully past: started 08:00, ended 09:00
             Event {
@@ -532,6 +642,7 @@ mod tests {
                 start: parse_datetime("2024-01-15 08:00").unwrap(),
                 end: parse_datetime("2024-01-15 09:00"),
                 location: None,
+                is_all_day: false,
             },
             // Future: starts 14:00
             Event {
@@ -539,6 +650,7 @@ mod tests {
                 start: parse_datetime("2024-01-15 14:00").unwrap(),
                 end: parse_datetime("2024-01-15 15:00"),
                 location: None,
+                is_all_day: false,
             },
             // Past with no end time: started 08:00
             Event {
@@ -546,6 +658,7 @@ mod tests {
                 start: parse_datetime("2024-01-15 08:00").unwrap(),
                 end: None,
                 location: None,
+                is_all_day: false,
             },
         ];
 

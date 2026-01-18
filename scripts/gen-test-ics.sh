@@ -8,31 +8,30 @@ set -euo pipefail
 now=$(date +%s)
 
 # Generate a VEVENT
-# Usage: event [-u] offset_minutes summary [location]
+# Usage: event [-u] [-a] offset summary [location]
 #   -u: Use UTC time (Z suffix)
+#   -a: All-day event (offset in days)
 event() {
-    local utc="" date_flag="" suffix="" uid_prefix="test"
-    if [[ "${1:-}" == "-u" ]]; then
-        utc=1; date_flag="-u"; suffix="Z"; uid_prefix="test-utc"
-        shift
-    fi
+    local date_flag="" suffix="" uid="test" mult=60 dur=3600 fmt="%Y%m%dT%H%M%S" vd=""
 
-    local offset_min=$1
-    local summary=$2
-    local location=${3:-}
+    [[ "${1:-}" == "-u" ]] && { date_flag="-u"; suffix="Z"; uid="utc"; shift; }
 
-    local start_ts=$((now + offset_min * 60))
-    local end_ts=$((start_ts + 3600))  # 1 hr
+    [[ "${1:-}" == "-a" ]] && { mult=86400; dur=86400; fmt="%Y%m%d"; vd=";VALUE=DATE"; uid="allday"; suffix=""; shift; }
 
-    local start=$(date $date_flag -d "@$start_ts" +%Y%m%dT%H%M%S)
-    local end=$(date $date_flag -d "@$end_ts" +%Y%m%dT%H%M%S)
+    local offset=$1 summary=$2 location=${3:-}
+    local start_ts=$((now + offset * mult))
+    local end_ts=$((start_ts + dur))
+    local start=$(date $date_flag -d "@$start_ts" +$fmt)
+    local end=$(date $date_flag -d "@$end_ts" +$fmt)
 
     echo "BEGIN:VEVENT"
-    echo "UID:${uid_prefix}-${offset_min}-$$@zj-cal"
-    echo "DTSTART:${start}${suffix}"
-    echo "DTEND:${end}${suffix}"
+    echo "UID:${uid}-${offset}-$$@zj-cal"
+    echo "DTSTART${vd}:${start}${suffix}"
+    echo "DTEND${vd}:${end}${suffix}"
     echo "SUMMARY:$summary"
+
     [[ -n "$location" ]] && echo "LOCATION:$location"
+
     echo "END:VEVENT"
 }
 
@@ -59,5 +58,9 @@ event -u   1080    "Customer Call (UTC)"            "https://zoom.us/j/123"
 event      1440    "Board Meeting"                  "https://meet.google.com/abc"
 event      2880    "Conference Prep"
 event      4320    "Offsite Planning"               "https://teams.microsoft.com/l/meetup"
+
+event -a   0       "Company Holiday"
+event -a   1       "Team Offsite"
+event -a   3       "Conference Day 1"
 
 echo "END:VCALENDAR"

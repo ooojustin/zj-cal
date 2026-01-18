@@ -2,7 +2,7 @@
 mod macros;
 mod calendar;
 mod config;
-use chrono::{NaiveDateTime, Timelike};
+use chrono::{NaiveDate, NaiveDateTime, Timelike};
 use config::Config;
 use owo_colors::OwoColorize;
 use std::collections::BTreeMap;
@@ -154,29 +154,68 @@ impl ZellijPlugin for State {
         }
 
         // Reserve: 1 header + 1 separator + 1 "+more" + 1 buffer for floating mode
-        let max_events = rows.saturating_sub(4);
+        let max_lines = rows.saturating_sub(4);
         let now = self.current_time.unwrap_or_default();
-        for event in self.events.iter().take(max_events) {
-            let in_progress = event.is_in_progress(now);
+        let today = now.date();
+        let mut current_group: Option<NaiveDate> = None;
+        let mut lines_used = 0;
+        let mut events_shown = 0;
+
+        for event in &self.events {
+            let active_today = event.is_active_on(today);
+            let event_date = if active_today {
+                today
+            } else {
+                event.start.date()
+            };
+
+            // Print group header if day changed
+            if current_group != Some(event_date) {
+                // (need room for header + at least 1 event)
+                if lines_used + 2 > max_lines {
+                    break;
+                }
+                let header = calendar::fmt_day_header(event_date, today);
+                println!("{}", header.bold());
+                current_group = Some(event_date);
+                lines_used += 1;
+            }
+
+            if lines_used >= max_lines {
+                break;
+            }
+
+            // Format time based on group
+            let is_today = event_date == today;
+            let in_progress = !event.is_all_day && event.is_in_progress(now);
             let time = if in_progress {
                 "now".to_string()
             } else {
-                calendar::fmt_relative_time(event.start, now, self.use_12h_time)
+                calendar::fmt_time_in_group(
+                    event.start,
+                    now,
+                    is_today,
+                    event.is_all_day,
+                    self.use_12h_time,
+                )
             };
-            let summary = truncate(&event.summary, width.saturating_sub(time.len() + 3));
+
+            // Render event line (indented under group)
+            let summary = truncate(&event.summary, width.saturating_sub(time.len() + 5));
             let icon = if event.is_video_call() { "📹" } else { "•" };
-            if time == "now" {
-                println!("{} {} {}", time.green().bold(), icon, summary.bold());
+            let highlight = time == "now" || (event.is_all_day && active_today);
+            if highlight {
+                println!("  {} {} {}", time.green().bold(), icon, summary.bold());
             } else {
-                println!("{} {} {}", time.cyan(), icon, summary);
+                println!("  {} {} {}", time.cyan(), icon, summary);
             }
+            lines_used += 1;
+            events_shown += 1;
         }
 
-        if self.events.len() > max_events {
-            println!(
-                "{}",
-                format!("  +{} more", self.events.len() - max_events).dimmed()
-            );
+        let remaining = self.events.len() - events_shown;
+        if remaining > 0 {
+            println!("{}", format!("  +{} more", remaining).dimmed());
         }
     }
 }
