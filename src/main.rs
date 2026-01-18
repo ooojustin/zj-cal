@@ -31,6 +31,7 @@ struct State {
     loading: bool,
     permission_granted: bool,
     current_time: Option<NaiveDateTime>,
+    utc_offset_minutes: i32,
     ticks_until_calendar: u32,
     use_12h_time: bool,
 }
@@ -181,12 +182,12 @@ impl ZellijPlugin for State {
 }
 
 impl State {
-    /// Fetches the current local time via shell command.
+    /// Fetches the current local time and UTC offset via shell command.
     fn fetch_time(&mut self) {
         log!("fetch_time() - getting current time");
         self.loading = true;
         // NOTE: We do this via shell because WASM sandbox doesn't have access to timezone info.
-        run_command(&["date", "+%Y-%m-%d %H:%M"], Ctx::TimeFetch.into_map());
+        run_command(&["date", "+%Y-%m-%d %H:%M %z"], Ctx::TimeFetch.into_map());
     }
 
     fn fetch_calendar(&mut self) {
@@ -230,7 +231,7 @@ impl State {
         self.loading = false;
         if exit_code == Some(0) {
             log!("{} ({} bytes)", action_label, stdout.len());
-            match calendar::parse_ics(&stdout) {
+            match calendar::parse_ics(&stdout, self.utc_offset_minutes) {
                 Ok(events) => {
                     self.events = calendar::filter_future(events, self.current_time, 20);
                     self.error = None;
@@ -256,9 +257,19 @@ impl State {
 
     fn handle_time_fetch(&mut self, exit_code: Option<i32>, stdout: Vec<u8>, stderr: Vec<u8>) {
         if exit_code == Some(0) {
-            let time_str = String::from_utf8_lossy(&stdout).trim().to_string();
-            self.current_time = calendar::parse_datetime(&time_str);
-            log!("Current time: {:?}", self.current_time);
+            // Parse "YYYY-MM-DD HH:MM +/-HHMM" format
+            let output = String::from_utf8_lossy(&stdout).trim().to_string();
+            if let Some((time_str, offset_str)) = output.rsplit_once(' ') {
+                self.current_time = calendar::parse_datetime(time_str);
+                if let Some(offset) = calendar::parse_utc_offset(offset_str) {
+                    self.utc_offset_minutes = offset;
+                }
+            }
+            log!(
+                "Current time: {:?}, UTC offset: {} min",
+                self.current_time,
+                self.utc_offset_minutes
+            );
 
             // Fetch calendar when counter reaches 0
             if self.ticks_until_calendar == 0 {

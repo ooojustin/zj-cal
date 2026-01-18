@@ -26,7 +26,7 @@ impl Event {
 }
 
 /// Parses ICS calendar data into a list of events.
-pub fn parse_ics(data: &[u8]) -> Result<Vec<Event>, String> {
+pub fn parse_ics(data: &[u8], utc_offset_minutes: i32) -> Result<Vec<Event>, String> {
     let content = String::from_utf8_lossy(data);
     let calendar: Calendar = content.parse().map_err(|e| format!("Parse error: {}", e))?;
 
@@ -36,8 +36,12 @@ pub fn parse_ics(data: &[u8]) -> Result<Vec<Event>, String> {
         .filter_map(|component| {
             if let CalendarComponent::Event(event) = component {
                 let summary = event.get_summary().unwrap_or("(no title)").to_string();
-                let start = event.get_start().map(parse_date_perhaps_time)?;
-                let end = event.get_end().map(parse_date_perhaps_time);
+                let start = event
+                    .get_start()
+                    .map(|dt| parse_date_perhaps_time(dt, utc_offset_minutes))?;
+                let end = event
+                    .get_end()
+                    .map(|dt| parse_date_perhaps_time(dt, utc_offset_minutes));
                 let location = event.get_location().map(|s| s.to_string());
 
                 Some(Event {
@@ -69,37 +73,38 @@ pub fn filter_future(
     events
 }
 
-/// Converts ICS DatePerhapsTime to NaiveDateTime.
-/// (all-day events get 00:00)
-fn parse_date_perhaps_time(dt: DatePerhapsTime) -> NaiveDateTime {
+/// Converts ICS DatePerhapsTime to NaiveDateTime in local time.
+/// All-day events get 00:00.
+///
+/// Note: UTC offset is based on current time, not event time. Events crossing a DST
+/// boundary may be off by 1 hour. Acceptable for a near-term calendar widget.
+fn parse_date_perhaps_time(dt: DatePerhapsTime, utc_offset_minutes: i32) -> NaiveDateTime {
     match dt {
         DatePerhapsTime::DateTime(cdt) => match cdt {
             CalendarDateTime::Floating(dt) => dt,
-            CalendarDateTime::Utc(dt) => dt.naive_utc(),
+            CalendarDateTime::Utc(dt) => {
+                dt.naive_utc() + chrono::Duration::minutes(utc_offset_minutes as i64)
+            }
             CalendarDateTime::WithTimezone { date_time, .. } => date_time,
         },
         DatePerhapsTime::Date(date) => date.and_hms_opt(0, 0, 0).unwrap(),
     }
 }
 
-/// Converts months number (1-12) to short name.
-/// (e.g., 1 -> "jan", 2 -> "feb", etc.)
-fn month_name(month: u32) -> &'static str {
-    match month {
-        1 => "jan",
-        2 => "feb",
-        3 => "mar",
-        4 => "apr",
-        5 => "may",
-        6 => "jun",
-        7 => "jul",
-        8 => "aug",
-        9 => "sep",
-        10 => "oct",
-        11 => "nov",
-        12 => "dec",
-        _ => unreachable!(),
+/// Parses UTC offset string (e.g., "-0500", "+0530") to minutes.
+pub fn parse_utc_offset(s: &str) -> Option<i32> {
+    let s = s.trim();
+    if s.len() != 5 {
+        return None;
     }
+    let sign = match s.chars().next()? {
+        '+' => 1,
+        '-' => -1,
+        _ => return None,
+    };
+    let hours: i32 = s[1..3].parse().ok()?;
+    let minutes: i32 = s[3..5].parse().ok()?;
+    Some(sign * (hours * 60 + minutes))
 }
 
 /// Parses "YYYY-MM-DD HH:MM" string (from shell `date` command) to NaiveDateTime.
@@ -199,6 +204,26 @@ pub fn fmt_relative_time(event_dt: NaiveDateTime, now_dt: NaiveDateTime, use_12h
     }
 }
 
+/// Converts months number (1-12) to short name.
+/// (e.g., 1 -> "jan", 2 -> "feb", etc.)
+fn month_name(month: u32) -> &'static str {
+    match month {
+        1 => "jan",
+        2 => "feb",
+        3 => "mar",
+        4 => "apr",
+        5 => "may",
+        6 => "jun",
+        7 => "jul",
+        8 => "aug",
+        9 => "sep",
+        10 => "oct",
+        11 => "nov",
+        12 => "dec",
+        _ => unreachable!(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,7 +285,7 @@ mod tests {
 
     #[test]
     fn test_parse_timed_event() {
-        let events = parse_ics(ICS_TIMED_EVENT.as_bytes()).unwrap();
+        let events = parse_ics(ICS_TIMED_EVENT.as_bytes(), 0).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].summary, "Team Standup");
         assert_eq!(events[0].start.hour(), 10);
@@ -274,7 +299,7 @@ mod tests {
 
     #[test]
     fn test_parse_all_day_event() {
-        let events = parse_ics(ICS_ALL_DAY_EVENT.as_bytes()).unwrap();
+        let events = parse_ics(ICS_ALL_DAY_EVENT.as_bytes(), 0).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].summary, "Company Holiday");
         // All-day events should have 00:00 time
@@ -284,16 +309,18 @@ mod tests {
 
     #[test]
     fn test_parse_utc_event() {
-        let events = parse_ics(ICS_UTC_EVENT.as_bytes()).unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].summary, "UTC Meeting");
-        // UTC time should be converted to naive (15:00 UTC)
+        // With offset 0, UTC time stays as-is (15:00 UTC -> 15:00)
+        let events = parse_ics(ICS_UTC_EVENT.as_bytes(), 0).unwrap();
         assert_eq!(events[0].start.hour(), 15);
+
+        // With EST offset (-300 min), UTC time is converted (15:00 UTC -> 10:00 EST)
+        let events = parse_ics(ICS_UTC_EVENT.as_bytes(), -300).unwrap();
+        assert_eq!(events[0].start.hour(), 10);
     }
 
     #[test]
     fn test_parse_multiple_events() {
-        let events = parse_ics(ICS_MULTIPLE_EVENTS.as_bytes()).unwrap();
+        let events = parse_ics(ICS_MULTIPLE_EVENTS.as_bytes(), 0).unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].summary, "First Event");
         assert_eq!(events[1].summary, "Second Event");
