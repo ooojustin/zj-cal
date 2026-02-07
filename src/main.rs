@@ -1,9 +1,10 @@
 #[macro_use]
-mod macros;
+mod ctx;
 mod calendar;
 mod config;
 use chrono::{NaiveDate, NaiveDateTime, Timelike};
 use config::Config;
+use ctx::Ctx;
 use owo_colors::OwoColorize;
 use std::collections::BTreeMap;
 use zellij_tile::prelude::*;
@@ -14,13 +15,6 @@ pub const TIME_TICK_SECS: f64 = 30.0;
 /// Save fetched ICS files for debugging. (Path: `/tmp/zj-cal/`)
 /// Set ZJ_CAL_DEBUG_ICS=1 at build time.
 const DEBUG_SAVE_ICS: bool = option_env!("ZJ_CAL_DEBUG_ICS").is_some();
-
-define_ctx! {
-    TimeFetch => "time_fetch",
-    IcsFetch => "ics_fetch",
-    IcsFetchFile { path: String } => "ics_fetch_file",
-    IcsReadFile { path: String } => "ics_read_file",
-}
 
 #[derive(Default)]
 struct State {
