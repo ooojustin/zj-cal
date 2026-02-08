@@ -20,6 +20,7 @@ const DEBUG_SAVE_ICS: bool = option_env!("ZJ_CAL_DEBUG_ICS").is_some();
 struct State {
     events: Vec<calendar::Event>,
     ics_url: String,
+    ics_url_resolved: bool,
     calendar_refresh_ticks: u32, // Fetch calendar every N time ticks
     error: Option<String>,
     loading: bool,
@@ -37,6 +38,7 @@ impl ZellijPlugin for State {
         let config = Config::from(configuration);
 
         self.ics_url = config.ics_url;
+        self.ics_url_resolved = !self.ics_url.is_empty();
         self.use_12h_time = config.use_12h_time;
         self.calendar_refresh_ticks = (config.refresh_interval_secs / TIME_TICK_SECS).ceil() as u32;
         self.ticks_until_calendar = 0; // Fetch immediately on first tick
@@ -79,7 +81,11 @@ impl ZellijPlugin for State {
                 true
             }
             Event::Timer(_) => {
-                self.fetch_time();
+                if !self.ics_url_resolved {
+                    self.fetch_ics_url_from_env();
+                } else {
+                    self.fetch_time();
+                }
                 set_timeout(TIME_TICK_SECS);
                 true
             }
@@ -87,6 +93,9 @@ impl ZellijPlugin for State {
                 match Ctx::from_map(&ctx) {
                     Ok(Ctx::TimeFetch) => {
                         self.handle_time_fetch(exit_code, stdout, stderr);
+                    }
+                    Ok(Ctx::IcsFetchEnv) => {
+                        self.handle_env_fetch(exit_code, stdout, stderr);
                     }
                     Ok(Ctx::IcsFetch) => {
                         self.handle_ics_fetch(exit_code, stdout, stderr);
@@ -111,10 +120,17 @@ impl ZellijPlugin for State {
         let width = cols.min(50);
 
         if self.ics_url.is_empty() {
+            if !self.ics_url_resolved {
+                println!("{} {}", "📅 Calendar".blue().bold(), "↻".yellow());
+                return;
+            }
             println!("{}", "⚠ No ICS URL configured".yellow());
             println!();
             println!("Add to your plugin config:");
             println!("  ics_url \"https://...\"");
+            println!();
+            println!("Or set environment variable:");
+            println!("  export ZJ_CAL_ICS_URL=\"https://...\"");
             return;
         }
 
@@ -215,6 +231,30 @@ impl ZellijPlugin for State {
 }
 
 impl State {
+    /// Fetches ZJ_CAL_ICS_URL from the environment via shell command.
+    /// Called once at startup if ics_url is not set in plugin config.
+    fn fetch_ics_url_from_env(&mut self) {
+        log!("fetch_ics_url_from_env() - reading ZJ_CAL_ICS_URL");
+        run_command(&["printenv", "ZJ_CAL_ICS_URL"], Ctx::IcsFetchEnv.into_map());
+    }
+
+    fn handle_env_fetch(&mut self, exit_code: Option<i32>, stdout: Vec<u8>, stderr: Vec<u8>) {
+        let _ = stderr;
+        self.ics_url_resolved = true;
+        if exit_code == Some(0) {
+            let url = String::from_utf8_lossy(&stdout).trim().to_string();
+            if !url.is_empty() {
+                log!("Got ICS URL from env var ZJ_CAL_ICS_URL");
+                self.ics_url = url;
+            } else {
+                log!("ZJ_CAL_ICS_URL is set but empty");
+            }
+        } else {
+            log!("ZJ_CAL_ICS_URL not set in environment");
+        }
+        self.fetch_time();
+    }
+
     /// Fetches the current local time and UTC offset via shell command.
     fn fetch_time(&mut self) {
         log!("fetch_time() - getting current time");

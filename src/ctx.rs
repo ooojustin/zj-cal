@@ -11,6 +11,7 @@ macro_rules! log {
 #[serde(tag = "source", rename_all = "snake_case")]
 pub enum Ctx {
     TimeFetch,
+    IcsFetchEnv,
     IcsFetch,
     IcsFetchFile { path: String },
     IcsReadFile { path: String },
